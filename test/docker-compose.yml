@@ -3,14 +3,18 @@ version: '3.3'
 services:
 
     mongo:
-      image: mongo:${MONGO_VERSION:-3.2}
-      entrypoint: [ "/usr/bin/mongod", "--replSet", "${REPLICASET_NAME:-rs}", "--journal", "--smallfiles", "--bind_ip", "0.0.0.0"]
+      image: mongo:${MONGO_VERSION:-3.6}
+      entrypoint: [ "/usr/bin/mongod", "--auth", "--keyFile", "/mongo-keyfile", "--replSet", "${REPLICASET_NAME:-rs}", "--journal", "--smallfiles", "--bind_ip", "0.0.0.0"]
       ports:
         - "${MONGO_PORT:-27017}:27017"
       networks:
         - backend
       configs:
         - mongo-healthcheck
+        - source: mongo-keyfile
+          target: /mongo-keyfile
+          mode: 0400
+
       # it simply checks that the client can connect to mongo. No test is run w.r.t. the cluster.
       healthcheck:
           test: ["CMD", "bash", "/mongo-healthcheck"]
@@ -36,7 +40,9 @@ services:
         - MONGO_SERVICE_NAME=${STACK_NAME:-mongo}_mongo
         - REPLICASET_NAME=${REPLICASET_NAME:-rs}
         - MONGO_PORT=27017
-        - DEBUG #uncomment to test the script
+        - MONGO_ROOT_USERNAME=${MONGO_ROOT_USERNAME:-admin}
+        - MONGO_ROOT_PASSWORD=${MONGO_ROOT_USERNAME:-password}
+        - DEBUG=1 #uncomment to test the script
       entrypoint: python /src/replica_ctrl.py
       networks:
           - backend
@@ -54,6 +60,8 @@ configs:
   # to avoid changes to the original mongo image, we import the healthcheck script using configs
   mongo-healthcheck:
     file: mongo-healthcheck
+  mongo-keyfile:
+    file: mongo-keyfile
 
 networks:
     default:

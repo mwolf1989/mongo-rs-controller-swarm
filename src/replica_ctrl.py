@@ -37,7 +37,9 @@ def get_required_env_variables():
         'OVERLAY_NETWORK_NAME',
         'MONGO_SERVICE_NAME',
         'REPLICASET_NAME',
-        'MONGO_PORT'
+        'MONGO_PORT',
+        'MONGO_ROOT_USERNAME',
+        'MONGO_ROOT_PASSWORD',
     ]
     envs = {}
     for rv in REQUIRED_VARS:
@@ -86,7 +88,7 @@ def get_tasks_ips(tasks, overlay_network_name):
     return tasks_ips
 
 
-def init_replica(mongo_tasks_ips, replicaset_name, mongo_port):
+def init_replica(mongo_tasks, mongo_tasks_ips, replicaset_name, mongo_port, mongo_root_username, mongo_root_password):
     """
     Init a MongoDB replicaset from the scratch.
 
@@ -101,7 +103,34 @@ def init_replica(mongo_tasks_ips, replicaset_name, mongo_port):
 
     # Choose a primary and configure replicaset
     primary_ip = list(mongo_tasks_ips)[0]
-    primary = pm.MongoClient(primary_ip, mongo_port)
+
+    # Initialize replica set in localhost using docker
+    time.sleep(10)
+    dc = docker.from_env()
+    containers = [s for s in dc.containers.list() if s.name.split('.')[0] == mongo_service_name]
+    mongoContainer = containers[0]
+    clusterCreateExecRes = mongoContainer.exec_run("mongo --eval \"%s.initiate(%s)\"" % (replicaset_name, config))
+    logger.info("Created replicaset: {}".format(clusterCreateExecRes))
+
+    # Initialize admin by checking which container is primary, and then executing admin creation there
+    # https://docs.mongodb.com/v3.2/tutorial/enforce-keyfile-access-control-in-existing-replica-set/#create-a-keyfile
+    time.sleep(30)
+    primaryNoAuth = pm.MongoClient(host=primary_ip, port=mongo_port)
+    isMaster = primaryNoAuth.admin.command('ismaster')
+
+    primaryIp = isMaster["primary"].split(':')[0]
+    containerId = ""
+    for c in mongo_tasks:
+        ip = c["NetworksAttachments"][0]["Addresses"][0].split('/')[0]
+        if ip == primaryIp:
+            containerId = c["Status"]["ContainerStatus"]["ContainerID"]
+
+    primaryContainer = dc.containers.get(containerId)
+    createAdmin = "admin = db.getSiblingDB('admin'); admin.createUser({ user: '%s', pwd: '%s', roles: [ 'root' ] } );" % (mongo_root_username, mongo_root_password)
+    adminCreateExecRes = mongoContainer.exec_run("mongo --eval \"%s\"" % (createAdmin))
+    logger.info("Created root user: {}".format(adminCreateExecRes))
+
+    primary = pm.MongoClient(host=primary_ip, port=mongo_port, username=mongo_root_username, password=mongo_root_password)
     try:
         res = primary.admin.command("replSetInitiate", config)
     except OperationFailure as e:
@@ -128,11 +157,11 @@ def create_mongo_config(tasks_ips, replicaset_name, mongo_port):
     return config
 
 
-def gather_configured_members_ips(mongo_tasks_ips, mongo_port):
+def gather_configured_members_ips(mongo_tasks_ips, mongo_port, mongo_root_username, mongo_root_password):
     current_ips = set()
     logger = logging.getLogger(__name__)
     for t in mongo_tasks_ips:
-        mc = pm.MongoClient(t, mongo_port)
+        mc = pm.MongoClient(host=t, port=mongo_port, username=mongo_root_username, password=mongo_root_password)
         try:
             config = mc.admin.command("replSetGetConfig")['config']
             for m in config['members']:
@@ -148,12 +177,12 @@ def gather_configured_members_ips(mongo_tasks_ips, mongo_port):
     logger.debug("Current members in mongo configurations: {}".format(current_ips))
     return current_ips
 
-def get_primary_ip(tasks_ips, mongo_port):
+def get_primary_ip(tasks_ips, mongo_port, mongo_root_username, mongo_root_password):
     logger = logging.getLogger(__name__)
 
     primary_ips = []
     for t in tasks_ips:
-        mc = pm.MongoClient(t, mongo_port)
+        mc = pm.MongoClient(host=t, port=mongo_port, username=mongo_root_username, password=mongo_root_password)
         try:
             if mc.is_primary:
                 primary_ips.append(t)
@@ -172,7 +201,7 @@ def get_primary_ip(tasks_ips, mongo_port):
         return primary_ips[0]
 
 
-def update_config(primary_ip, current_ips, new_ips, mongo_port):
+def update_config(primary_ip, current_ips, new_ips, mongo_port, mongo_root_username, mongo_root_password):
     # Actually not too different from what mongo does:
     # https://github.com/mongodb/mongo/blob/master/src/mongo/shell/utils.js
     to_remove = set(current_ips) - set(new_ips)
@@ -190,7 +219,7 @@ def update_config(primary_ip, current_ips, new_ips, mongo_port):
         primary_ip = None
         while attempts and not primary_ip:
             time.sleep(10)
-            primary_ip = get_primary_ip(list(new_ips), mongo_port)
+            primary_ip = get_primary_ip(list(new_ips), mongo_port, mongo_root_username, mongo_root_password)
             attempts -= 1
             logger.debug("No new primary yet automatically elected...".format(primary_ip))
 
@@ -200,7 +229,7 @@ def update_config(primary_ip, current_ips, new_ips, mongo_port):
             primary_ip = old_members[0] if old_members else list(new_ips)[0]
             logger.debug("Choosing {} as the new primary".format(primary_ip))
 
-    cli = pm.MongoClient(primary_ip, mongo_port)
+    cli = pm.MongoClient(host=primary_ip, port=mongo_port, username=mongo_root_username, password=mongo_root_password)
     try:
         config = cli.admin.command("replSetGetConfig")['config']
         logger.debug("Old Members: {}".format(config['members']))
@@ -224,7 +253,7 @@ def update_config(primary_ip, current_ips, new_ips, mongo_port):
             for i, ip in enumerate(to_add):
                 config['members'].append({
                     '_id': offset + i,
-                    'host': "{}:{}".format(ip, mongo_port)
+                    'host': "{}:{}".format(ip, mongo_port, mongo_root_username, mongo_root_password)
                 })
 
         config['version'] += 1
@@ -237,7 +266,7 @@ def update_config(primary_ip, current_ips, new_ips, mongo_port):
         cli.close()
 
 
-def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_port):
+def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_port, mongo_root_username, mongo_root_password):
     """
     To manage the replica is to:
     - Configure replicaset
@@ -261,16 +290,16 @@ def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_p
     mongo_tasks_ips = get_tasks_ips(mongo_tasks, overlay_network_name)
     logger.debug("Mongo tasks ips: {}".format(mongo_tasks_ips))
 
-    current_member_ips = gather_configured_members_ips(mongo_tasks_ips, mongo_port)
+    current_member_ips = gather_configured_members_ips(mongo_tasks_ips, mongo_port, mongo_root_username, mongo_root_password)
     logger.debug("Current mongo ips: {}".format(current_member_ips))
-    primary_ip = get_primary_ip(current_member_ips, mongo_port)
+    primary_ip = get_primary_ip(current_member_ips, mongo_port, mongo_root_username, mongo_root_password)
     logger.debug("Current primary ip: {}".format(primary_ip))
 
     if len(current_member_ips) == 0:
         # Starting from the scratch
         logger.info("No previous valid configuration, starting replicaset from scratch")
         current_member_ips = set(mongo_tasks_ips)
-        init_replica(current_member_ips, replicaset_name, mongo_port)
+        init_replica(mongo_tasks, current_member_ips, replicaset_name, mongo_port, mongo_root_username, mongo_root_password)
 
     # Watch for IP changes. If IPs remain stable we assume MongoDB maintains the replicaset working fine.
     # TODO: Test what happens with an IP swap of members of a working replicaset.
@@ -278,9 +307,9 @@ def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_p
         time.sleep(10)
         new_member_ips = set(get_tasks_ips(get_running_tasks(mongo_service), overlay_network_name))
         if current_member_ips.symmetric_difference(new_member_ips):
-            update_config(primary_ip, current_member_ips, new_member_ips, mongo_port)
+            update_config(primary_ip, current_member_ips, new_member_ips, mongo_port, mongo_root_username, mongo_root_password)
         current_member_ips = new_member_ips
-        primary_ip = get_primary_ip(new_member_ips, mongo_port)
+        primary_ip = get_primary_ip(new_member_ips, mongo_port, mongo_root_username, mongo_root_password)
 
 
 if __name__ == '__main__':
