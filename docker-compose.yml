@@ -5,7 +5,7 @@ services:
   mongo:
     image: mongo:${MONGO_VERSION:-3.6}
     # the bind_ip option is requried from MONGO Version 3.6, alternatively you can use --bind_ip_all
-    entrypoint: [ "/usr/bin/mongod", "--keyFile", "/mongo-keyfile", "--replSet", "${REPLICASET_NAME:-rs}", "--journal", "--smallfiles", "--bind_ip", "0.0.0.0"]
+    entrypoint: [ "/usr/bin/mongod", "--keyFile", "/run/secrets/mongo-keyfile", "--replSet", "${REPLICASET_NAME:-rs}", "--journal", "--smallfiles", "--bind_ip", "0.0.0.0"]
     # ports:
     #   - "${MONGO_PORT:-27017}:27017"
     # The usage of volume provides persistence, but may work correctly only with 1 volume per node (that's why global mode is recommended)
@@ -16,8 +16,11 @@ services:
     configs:
     # to avoid changes to the original mongo image, we import the healthcheck script using configs
       - mongo-healthcheck
+      # - source: mongo-keyfile
+      #   target: /mongo-keyfile
+      #   mode: 0400
+    secrets:
       - source: mongo-keyfile
-        target: /mongo-keyfile
         mode: 0400
     # it simply checks that the client can connect to mongo. No test is run w.r.t. the cluster.
     healthcheck:
@@ -34,7 +37,7 @@ services:
         delay: 1m30s
 
   controller:
-    image: martel/mongo-replica-ctrl:latest
+    image: tpisto/mongo-replica-ctrl:latest
     volumes:
       # TODO: Avoid exposing the docker socket (security issue)
       - /var/run/docker.sock:/var/run/docker.sock
@@ -63,8 +66,12 @@ configs:
   # to avoid changes to the original mongo image, we import the healthcheck script using configs
   mongo-healthcheck:
     file: mongo-healthcheck
+  # mongo-keyfile:
+  #   file: mongo-keyfile
+
+secrets:
   mongo-keyfile:
-    file: mongo-keyfile
+    external: true
 
 volumes:
   # External true ensures that the volume is not re-created if already present

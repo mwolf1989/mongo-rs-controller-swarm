@@ -2,71 +2,83 @@ version: '3.3'
 
 services:
 
-    mongo:
-      image: mongo:${MONGO_VERSION:-3.6}
-      entrypoint: [ "/usr/bin/mongod", "--auth", "--keyFile", "/mongo-keyfile", "--replSet", "${REPLICASET_NAME:-rs}", "--journal", "--smallfiles", "--bind_ip", "0.0.0.0"]
-      ports:
-        - "${MONGO_PORT:-27017}:27017"
-      networks:
-        - backend
-      configs:
-        - mongo-healthcheck
-        - source: mongo-keyfile
-          target: /mongo-keyfile
-          mode: 0400
+  mongo:
+    image: mongo:${MONGO_VERSION:-3.6}
+    # the bind_ip option is requried from MONGO Version 3.6, alternatively you can use --bind_ip_all
+    entrypoint: [ "/usr/bin/mongod", "--keyFile", "/run/secrets/mongo-keyfile", "--replSet", "${REPLICASET_NAME:-rs}", "--journal", "--smallfiles", "--bind_ip", "0.0.0.0"]
+    # ports:
+    #   - "${MONGO_PORT:-27017}:27017"
+    # The usage of volume provides persistence, but may work correctly only with 1 volume per node (that's why global mode is recommended)
+    volumes:
+      - mongodata:/data/db
+    networks:
+      - backend
+    configs:
+    # to avoid changes to the original mongo image, we import the healthcheck script using configs
+      - mongo-healthcheck
+      # - source: mongo-keyfile
+      #   target: /mongo-keyfile
+      #   mode: 0400
+    secrets:
+      - source: mongo-keyfile
+        mode: 0400
+    # it simply checks that the client can connect to mongo. No test is run w.r.t. the cluster.
+    healthcheck:
+        test: ["CMD", "bash", "/mongo-healthcheck"]
+        interval: 1m
+        timeout: 10s
+        retries: 3
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+      update_config:
+        parallelism: 1
+        delay: 1m30s
 
-      # it simply checks that the client can connect to mongo. No test is run w.r.t. the cluster.
-      healthcheck:
-          test: ["CMD", "bash", "/mongo-healthcheck"]
-          interval: 1m
-          timeout: 10s
-          retries: 3
-      deploy:
-        mode: replicated
-        replicas: 3
-        restart_policy:
-          condition: on-failure
-        update_config:
-          parallelism: 1
-          delay: 1m30s
-
-    controller:
-      image: martel/mongo-replica-ctrl:travis
-      volumes:
-        # TODO: Avoid exposing the docker socket (security issue)
-        - /var/run/docker.sock:/var/run/docker.sock
-      environment:
-        - OVERLAY_NETWORK_NAME=${STACK_NAME:-mongo}_backend
-        - MONGO_SERVICE_NAME=${STACK_NAME:-mongo}_mongo
-        - REPLICASET_NAME=${REPLICASET_NAME:-rs}
-        - MONGO_PORT=27017
-        - MONGO_ROOT_USERNAME=${MONGO_ROOT_USERNAME:-admin}
-        - MONGO_ROOT_PASSWORD=${MONGO_ROOT_USERNAME:-password}
-        - DEBUG=1 #uncomment to test the script
-      entrypoint: python /src/replica_ctrl.py
-      networks:
-          - backend
-      depends_on:
-          - "mongo"
-      deploy:
-        mode: replicated
-        replicas: 1
-        placement:
-          constraints: [node.role==manager]
-        restart_policy:
-          condition: on-failure
+  controller:
+    image: martel/mongo-replica-ctrl:latest
+    volumes:
+      # TODO: Avoid exposing the docker socket (security issue)
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - OVERLAY_NETWORK_NAME=${BACKEND_NETWORK_NAME:-backend}
+      - MONGO_SERVICE_NAME=${STACK_NAME:-mongo}_mongo
+      - REPLICASET_NAME=${REPLICASET_NAME:-rs}
+      - MONGO_PORT=27017
+      - MONGO_ROOT_USERNAME=${MONGO_ROOT_USERNAME:-admin}
+      - MONGO_ROOT_PASSWORD=${MONGO_ROOT_USERNAME:-password}
+      - DEBUG=1 #uncomment to debug the script
+    entrypoint: python /src/replica_ctrl.py
+    networks:
+      - backend
+    depends_on:
+      - "mongo"
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role==manager]
+      restart_policy:
+        condition: on-failure
 
 configs:
   # to avoid changes to the original mongo image, we import the healthcheck script using configs
   mongo-healthcheck:
     file: mongo-healthcheck
+  # mongo-keyfile:
+  #   file: mongo-keyfile
+
+secrets:
   mongo-keyfile:
-    file: mongo-keyfile
+    external: true
+
+volumes:
+  # External true ensures that the volume is not re-created if already present
+  mongodata:
+    external: true
 
 networks:
-    default:
-        driver_opts:
-            com.docker.network.driver.mtu: ${DOCKER_MTU:-1500}
-    backend:
-        driver: overlay
-        # external: true # uncomment if you want to re-use and existing network! if not it will create a network dedicated to the stack!
+  backend:
+    external:
+      name: ${BACKEND_NETWORK_NAME:-backend}

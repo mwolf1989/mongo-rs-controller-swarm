@@ -5,6 +5,7 @@ oneTimeSetUp(){
   miniswarm start 3
   eval $(docker-machine env ms-manager0)
   docker network create  --attachable --opt encrypted -d overlay backend
+  docker secret create mongo-keyfile ./mongo-keyfile
   docker stack deploy -c docker-compose.yml mongo
   docker run --name client --network=backend -d mongo:3.2 tail -f /dev/null
   echo "Created MongoDB Client"

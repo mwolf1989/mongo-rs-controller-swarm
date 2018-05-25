@@ -1,2 +1,2 @@
 #!/bin/sh
-docker build . -t martel/mongo-replica-ctrl:latest
+docker build . -t tpisto/mongo-replica-ctrl:latest
